@@ -7,13 +7,13 @@ pub fn is_m4v(buf: &[u8]) -> bool {
 /// Returns whether a buffer is MKV video data.
 #[must_use]
 pub fn is_mkv(buf: &[u8]) -> bool {
-    is_ebml_doctype(buf, b"\x42\x82\x88matroska")
+    ebml_doctype(buf) == Some(b"matroska")
 }
 
 /// Returns whether a buffer is WEBM video data.
 #[must_use]
 pub fn is_webm(buf: &[u8]) -> bool {
-    is_ebml_doctype(buf, b"\x42\x82\x84webm")
+    ebml_doctype(buf) == Some(b"webm")
 }
 
 /// Returns whether a buffer is Quicktime MOV video data.
@@ -90,10 +90,45 @@ pub fn is_mp4(buf: &[u8]) -> bool {
         )
 }
 
-fn is_ebml_doctype(buf: &[u8], doctype: &[u8]) -> bool {
-    const EBML_MAGIC: &[u8; 4] = b"\x1a\x45\xdf\xa3";
-    const EBML_SEARCH_LIMIT: usize = 256;
+/// Reads an EBML variable-length integer, returning (value, bytes consumed).
+fn read_vint(buf: &[u8]) -> Option<(u64, usize)> {
+    let first = *buf.first()?;
+    if first == 0 {
+        return None; // Widths beyond 8 bytes unsupported
+    }
+    let width = first.leading_zeros() as usize + 1;
+    let value = buf
+        .get(1..width)?
+        .iter()
+        .fold(u64::from(first) & (0xFF >> width), |acc, &b| {
+            acc << 8 | u64::from(b)
+        });
+    Some((value, width))
+}
 
-    buf.starts_with(EBML_MAGIC)
-        && crate::match_bytes(&buf[..buf.len().min(EBML_SEARCH_LIMIT)], doctype)
+/// Walks the EBML header's child elements and returns the DocType value,
+/// with trailing zero-padding stripped.
+fn ebml_doctype(buf: &[u8]) -> Option<&[u8]> {
+    let rest = buf.strip_prefix(b"\x1a\x45\xdf\xa3")?; // EBML header element ID
+    let (header_len, consumed) = read_vint(rest)?;
+    let header_len = usize::try_from(header_len).ok()?;
+    let mut header = rest.get(consumed..consumed.checked_add(header_len)?)?;
+
+    while !header.is_empty() {
+        // Element ID: vint-shaped, but the marker bits are kept as part of the ID.
+        let id_width = header.first()?.leading_zeros() as usize + 1;
+        let (id, rest) = header.split_at_checked(id_width)?;
+
+        let (len, consumed) = read_vint(rest)?;
+        let len = usize::try_from(len).ok()?;
+        let end = consumed.checked_add(len)?;
+        let payload = rest.get(consumed..end)?;
+
+        if id == [0x42, 0x82] {
+            let pad = payload.iter().rev().take_while(|&&b| b == 0).count();
+            return Some(&payload[..payload.len() - pad]);
+        }
+        header = &rest[end..];
+    }
+    None
 }
